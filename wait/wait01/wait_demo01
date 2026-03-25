@@ -1,0 +1,105 @@
+// serial_wq.c — 多线程串行执行示例（内核等待队列）
+#include <linux/module.h>
+#include <linux/kernel.h>
+#include <linux/kthread.h>
+#include <linux/wait.h>
+#include <linux/delay.h>
+#include <linux/slab.h>
+
+#define NUM_THREADS 5
+
+/* 等待队列头 */
+static DECLARE_WAIT_QUEUE_HEAD(wq);
+
+/* 令牌：值为哪个线程的 tid，哪个线程就可以运行 */
+static atomic_t can_run = ATOMIC_INIT(0);
+
+/* 线程句柄 */
+static struct task_struct *threads[NUM_THREADS];
+
+/* ------------------------------------------------------------------ */
+/*  工作线程                                                             */
+/* ------------------------------------------------------------------ */
+static int worker_thread(void *data)
+{
+  int tid = (int)(long)data;
+
+  /*
+    * wait_event 会：
+    *   1. 检查条件 atomic_read(&can_run) == tid
+    *   2. 条件为假 → 将自己加入 wq，设置为 TASK_INTERRUPTIBLE，调度出去
+    *   3. 被 wake_up 唤醒后重新检查条件，直到为真才返回
+    */
+  wait_event_interruptible(wq, atomic_read(&can_run) == tid);
+
+  if (kthread_should_stop())
+    return 0;
+
+  /* ---- 临界区：每次只有一个线程进入 ---- */
+  pr_info("[wq_demo] thread %d: 开始执行任务\n", tid);
+  msleep(200);   /* 模拟工作耗时 */
+  pr_info("[wq_demo] thread %d: 任务完成\n", tid);
+  /* ---- 临界区结束 ---- */
+
+  /*
+    * 把令牌交给下一个线程，然后唤醒等待队列里的所有睡眠者。
+    * 被唤醒的线程会再次检查条件，只有 tid == can_run 的那个
+    * 才能真正运行，其余的重新睡回去 —— 实现"唤醒一个"的语义。
+    */
+  atomic_set(&can_run, tid + 1);
+  wake_up(&wq);          /* 只需要唤醒一次；内核会从队列头取第一个 */
+
+  return 0;
+}
+
+/* ------------------------------------------------------------------ */
+/*  模块初始化 / 退出                                                    */
+/* ------------------------------------------------------------------ */
+static int __init serial_wq_init(void)
+{
+    int i;
+
+    pr_info("[wq_demo] 加载模块，启动 %d 个线程\n", NUM_THREADS);
+
+    /* 令牌初始给线程 0 */
+    atomic_set(&can_run, 0);
+
+    for (i = 0; i < NUM_THREADS; i++) {
+        threads[i] = kthread_run(worker_thread,
+                                 (void *)(long)i,
+                                 "wq_worker/%d", i);
+        if (IS_ERR(threads[i])) {
+            pr_err("[wq_demo] 创建线程 %d 失败\n", i);
+            return PTR_ERR(threads[i]);
+        }
+    }
+
+    return 0;
+}
+
+static void __exit serial_wq_exit(void)
+{
+    int i;
+
+    /*
+     * 退出时唤醒所有等待者，防止线程卡在 wait_event 里无法被 stop。
+     * 将 can_run 设置为 NUM_THREADS（不匹配任何 tid），
+     * 再用 kthread_should_stop() 让线程感知退出信号。
+     */
+    atomic_set(&can_run, NUM_THREADS);
+    wake_up_all(&wq);
+
+    for (i = 0; i < NUM_THREADS; i++) {
+        if (threads[i] && !IS_ERR(threads[i]))
+            kthread_stop(threads[i]);
+    }
+
+    pr_info("[wq_demo] 模块卸载完成\n");
+}
+
+module_init(serial_wq_init);
+module_exit(serial_wq_exit);
+
+MODULE_LICENSE("GPL");
+MODULE_DESCRIPTION("内核等待队列 — 多线程串行执行示例");
+MODULE_AUTHOR("Demo");

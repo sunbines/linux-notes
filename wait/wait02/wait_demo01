@@ -1,0 +1,104 @@
+// serial_wq_ticket.c — 无需知道 tid，按到达顺序串行执行
+#include <linux/module.h>
+#include <linux/kernel.h>
+#include <linux/kthread.h>
+#include <linux/wait.h>
+#include <linux/atomic.h>
+#include <linux/delay.h>
+
+#define NUM_THREADS 5
+
+/* 等待队列 */
+static DECLARE_WAIT_QUEUE_HEAD(wq);
+
+/*
+ * ticket_counter : 发号机，每个线程原子地领一个唯一号码
+ * now_serving    : 当前叫到的号，做完一个 +1
+ */
+static atomic_t ticket_counter = ATOMIC_INIT(0);
+static atomic_t now_serving    = ATOMIC_INIT(0);
+
+static struct task_struct *threads[NUM_THREADS];
+
+/* ------------------------------------------------------------------ */
+static int worker_thread(void *data)
+{
+  /*
+    * 1. 原子领号：my_ticket 就是本线程的"排队序号"
+    *    atomic_fetch_add 返回加之前的旧值，保证每人号码唯一且递增
+    */
+  int my_ticket = atomic_fetch_add(1, &ticket_counter);
+
+  pr_info("[ticket] 线程 %s 领到号码 %d\n",
+          current->comm, my_ticket);
+
+  /*
+    * 2. 等待叫到自己的号
+    *    wait_event_interruptible 会：
+    *      a. 检查条件；条件为真立刻返回
+    *      b. 条件为假 → 挂入 wq 睡眠
+    *      c. 被 wake_up_all 唤醒后重新检查，直到条件为真
+    *
+    *    无需知道其他线程的任何信息，完全靠号码自动对号入座。
+    */
+  wait_event_interruptible(wq,
+      atomic_read(&now_serving) == my_ticket ||
+      kthread_should_stop());
+
+  if (kthread_should_stop())
+      return 0;
+
+  /* ---- 临界区：此刻只有一个线程在这里 ---- */
+  pr_info("[ticket] >>> 号码 %d 开始执行\n", my_ticket);
+  msleep(300);
+  pr_info("[ticket] <<< 号码 %d 执行完毕\n", my_ticket);
+  /* ---- 临界区结束 ---- */
+
+  /*
+    * 3. 叫下一号，唤醒所有睡眠线程
+    *    wake_up_all 把队列里所有人都唤醒，
+    *    但只有 now_serving == my_ticket+1 的那个线程
+    *    能通过 wait_event 的条件检查，其余人重新睡回去。
+    */
+  atomic_inc(&now_serving);
+  wake_up_all(&wq);
+
+  return 0;
+}
+
+/* ------------------------------------------------------------------ */
+static int __init ticket_wq_init(void)
+{
+  int i;
+  pr_info("[ticket] 模块加载，启动 %d 个线程\n", NUM_THREADS);
+
+  for (i = 0; i < NUM_THREADS; i++) {
+      threads[i] = kthread_run(worker_thread, NULL,
+                                "ticket_worker/%d", i);
+      if (IS_ERR(threads[i])) {
+          pr_err("[ticket] 创建线程失败 i=%d\n", i);
+          return PTR_ERR(threads[i]);
+      }
+      /* 稍微错开启动时间，模拟真实的"先后到达" */
+      msleep(50);
+  }
+  return 0;
+}
+
+static void __exit ticket_wq_exit(void)
+{
+    int i;
+    /* 让所有等待中的线程感知退出 */
+    for (i = 0; i < NUM_THREADS; i++)
+        if (threads[i] && !IS_ERR(threads[i]))
+            kthread_stop(threads[i]);
+
+    /* 唤醒所有人，让它们检查 kthread_should_stop() */
+    wake_up_all(&wq);
+    pr_info("[ticket] 模块卸载\n");
+}
+
+module_init(ticket_wq_init);
+module_exit(ticket_wq_exit);
+MODULE_LICENSE("GPL");
+MODULE_DESCRIPTION("等待队列取号排队串行执行");

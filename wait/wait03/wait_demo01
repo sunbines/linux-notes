@@ -1,0 +1,164 @@
+// serial_manual_wq.c
+// 用手动等待队列架构实现多线程按到达顺序串行执行
+#include <linux/module.h>
+#include <linux/kernel.h>
+#include <linux/kthread.h>
+#include <linux/wait.h>
+#include <linux/atomic.h>
+#include <linux/sched.h>
+#include <linux/signal.h>
+#include <linux/delay.h>
+
+#define NUM_THREADS 5
+
+/* 全局等待队列头，所有线程排队等在这里 */
+static DECLARE_WAIT_QUEUE_HEAD(queue);
+
+/* 取号机：领号 / 叫号 */
+static atomic_t ticket_counter = ATOMIC_INIT(0);
+static atomic_t now_serving    = ATOMIC_INIT(0);
+
+static struct task_struct *threads[NUM_THREADS];
+
+/* ------------------------------------------------------------------ */
+/*  等待函数：用题目要求的手动架构实现"等到叫我的号"                      */
+/* ------------------------------------------------------------------ */
+static int wait_for_my_turn(int my_ticket)
+{
+    /*
+     * DECLARE_WAITQUEUE 在栈上声明一个等待项，
+     * current 指向本线程的 task_struct，无需传入任何 id。
+     */
+    DECLARE_WAITQUEUE(wait, current);
+
+    for (;;) {
+        /*
+         * 1. 先入队，再设状态——顺序不能反。
+         *    如果先设状态再入队，可能在两步之间被唤醒，
+         *    导致错过唤醒信号，永久睡眠。
+         */
+        add_wait_queue(&queue, &wait);
+        set_current_state(TASK_INTERRUPTIBLE);
+
+        /*
+         * 2. 检查条件：轮到我了吗？
+         *    条件为真 → break，保持 TASK_INTERRUPTIBLE 状态退出循环，
+         *    后面统一恢复为 TASK_RUNNING。
+         */
+        if (atomic_read(&now_serving) == my_ticket)
+            break;
+
+        /*
+         * 3. 条件不满足，让出 CPU。
+         *    schedule() 会将线程从运行队列摘除，
+         *    等 wake_up / wake_up_all 把它重新放回运行队列。
+         */
+        schedule();
+
+        /*
+         * 4. 被唤醒后先离队，再做信号检查，
+         *    然后回到循环顶部重新 add_wait_queue + 检查条件。
+         *    这样做的好处：每次重新进队都是一次原子的"注册+检查"，
+         *    不会丢失在 schedule() 返回和重新 add 之间发来的唤醒。
+         */
+        remove_wait_queue(&queue, &wait);
+
+        if (signal_pending(current)) {
+            /* 收到信号，告知上层重启系统调用或直接退出 */
+            __set_current_state(TASK_RUNNING);
+            return -ERESTARTSYS;
+        }
+    }
+
+    /*
+     * 5. 从 break 出来：条件已满足。
+     *    恢复运行状态，从队列摘除自己。
+     *    必须先 set_current_state(TASK_RUNNING)，
+     *    否则后续代码可能在 TASK_INTERRUPTIBLE 状态下运行，
+     *    调度器会认为线程还想睡眠。
+     */
+    set_current_state(TASK_RUNNING);
+    remove_wait_queue(&queue, &wait);
+    return 0;
+}
+
+/* ------------------------------------------------------------------ */
+/*  工作线程                                                             */
+/* ------------------------------------------------------------------ */
+static int worker_thread(void *data)
+{
+    int ret;
+
+    /* 原子领号：先到的拿小号，后到的拿大号 */
+    int my_ticket = atomic_fetch_add(1, &ticket_counter);
+
+    pr_info("[mwq] %-20s 领号 %d\n", current->comm, my_ticket);
+
+    /* 等待叫号 */
+    ret = wait_for_my_turn(my_ticket);
+    if (ret) {
+        pr_warn("[mwq] 号码 %d 被信号中断，退出\n", my_ticket);
+        return ret;
+    }
+
+    /* ---- 临界区 ---- */
+    pr_info("[mwq] >>> 号码 %d [%s] 开始执行\n",
+            my_ticket, current->comm);
+    msleep(300);   /* 模拟工作 */
+    pr_info("[mwq] <<< 号码 %d [%s] 执行完毕\n",
+            my_ticket, current->comm);
+    /* ---- 临界区结束 ---- */
+
+    /*
+     * 叫下一号：
+     *   atomic_inc 先让 now_serving 递增，
+     *   wake_up_all 唤醒队列里所有人，
+     *   只有 now_serving == my_ticket+1 的线程能通过条件检查，
+     *   其余人在 for 循环里重新 schedule() 睡回去。
+     */
+    atomic_inc(&now_serving);
+    wake_up_all(&queue);
+
+    return 0;
+}
+
+/* ------------------------------------------------------------------ */
+static int __init mwq_init(void)
+{
+    int i;
+    pr_info("[mwq] 模块加载，启动 %d 个线程\n", NUM_THREADS);
+
+    for (i = 0; i < NUM_THREADS; i++) {
+        threads[i] = kthread_run(worker_thread, NULL,
+                                 "mwq_worker/%d", i);
+        if (IS_ERR(threads[i])) {
+            pr_err("[mwq] 创建线程 %d 失败\n", i);
+            return PTR_ERR(threads[i]);
+        }
+        msleep(30); /* 错开启动，产生真实的先后顺序 */
+    }
+    return 0;
+}
+
+static void __exit mwq_exit(void)
+{
+    int i;
+    /*
+     * 退出时：把 now_serving 推到一个不可能匹配的大值，
+     * 唤醒所有人，让它们在 signal_pending / kthread_should_stop
+     * 处退出。
+     */
+    atomic_set(&now_serving, NUM_THREADS + 999);
+    wake_up_all(&queue);
+
+    for (i = 0; i < NUM_THREADS; i++)
+        if (threads[i] && !IS_ERR(threads[i]))
+            kthread_stop(threads[i]);
+
+    pr_info("[mwq] 模块卸载完成\n");
+}
+
+module_init(mwq_init);
+module_exit(mwq_exit);
+MODULE_LICENSE("GPL");
+MODULE_DESCRIPTION("手动等待队列 — 取号串行执行");
